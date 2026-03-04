@@ -10,19 +10,27 @@ Flow (mirrors the CS.Money Chrome extension service worker):
   3. Every CHECK_ACTIVE_OFFERS_INTERVAL seconds also check active offers
      directly (catches cases where notification was missed).
   4. If historyOutdate is signalled, send the session unconditionally.
+
+Cookie persistence:
+  - Cookies are saved to csmoney_cookies.json after each login.
+  - On startup, saved cookies are tried first; full OpenID re-login is only
+    performed when the session is confirmed dead (401/403 or missing cookies).
+  - SessionExpiredError from CsMoneyClient triggers automatic re-login.
 """
 
 import asyncio
 import functools
+import json
 import logging
 import time
+from pathlib import Path
 
 import primp
 from aiosteampy import SteamClient
 from aiosteampy.models import ConfirmationType
 
 from . import config
-from .csmoney_client import CsMoneyClient
+from .csmoney_client import CsMoneyClient, SessionExpiredError
 from .openid_auth import openid_login
 from .session_crypto import encrypt_message
 
@@ -32,10 +40,57 @@ OFFER_BOUGHT = "OFFER_BOUGHT"
 CHECK_ACTIVE_OFFERS_INTERVAL = 360  # 6 minutes, same as extension alarm
 CONFIRMATION_INTERVAL = 15  # seconds between confirmation polls
 
+_COOKIE_FILE = Path("csmoney_cookies.json")
+
+
+def _load_saved_cookies() -> dict:
+    if _COOKIE_FILE.exists():
+        try:
+            cookies = json.loads(_COOKIE_FILE.read_text())
+            if cookies.get("csgo_ses"):
+                logger.info("Loaded saved CS.Money cookies from %s", _COOKIE_FILE)
+                return cookies
+        except Exception as exc:
+            logger.warning("Could not read %s: %s", _COOKIE_FILE, exc)
+    return {}
+
+
+def _save_cookies(cookies: dict) -> None:
+    try:
+        _COOKIE_FILE.write_text(json.dumps(cookies))
+        logger.debug("CS.Money cookies saved to %s", _COOKIE_FILE)
+    except Exception as exc:
+        logger.warning("Could not save cookies to %s: %s", _COOKIE_FILE, exc)
+
 
 def _steam_login_secure(steam: SteamClient) -> str:
     """Return the full steamLoginSecure cookie value: {steamId}%7C%7C{accessToken}."""
     return f"{steam.steam_id}%7C%7C{steam.access_token}"
+
+
+async def _do_openid_login(steam: SteamClient) -> dict:
+    """Run OpenID login in executor and return the full cookies dict."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(
+        None,
+        functools.partial(
+            openid_login,
+            _steam_login_secure(steam),
+            steam.session_id,
+        ),
+    )
+
+
+async def relogin(client: CsMoneyClient, steam: SteamClient) -> None:
+    """Perform a full OpenID re-login and update the client's cookies."""
+    logger.info("Session expired — performing OpenID re-login…")
+    if steam.is_access_token_expired:
+        logger.info("Steam access token expired — refreshing…")
+        await steam.refresh_access_token()
+    cookies = await _do_openid_login(steam)
+    client.update_cookies(cookies)
+    _save_cookies(cookies)
+    logger.info("Re-login successful.")
 
 
 async def send_steam_session(client: CsMoneyClient, steam: SteamClient) -> None:
@@ -59,6 +114,8 @@ async def send_steam_session(client: CsMoneyClient, steam: SteamClient) -> None:
             correlation_id=correlation_id,
         )
         logger.info("Steam session submitted successfully.")
+    except SessionExpiredError:
+        raise
     except Exception as exc:
         logger.error("Failed to send Steam session: %s", exc)
 
@@ -86,6 +143,8 @@ async def process_active_offers(client: CsMoneyClient, steam: SteamClient) -> No
                     "%d offer(s) in CREATING state — sending Steam session.", len(creating)
                 )
                 await send_steam_session(client, steam)
+    except SessionExpiredError:
+        raise
     except Exception as exc:
         logger.error("Error checking active offers: %s", exc)
 
@@ -129,6 +188,12 @@ async def run_notification_poller(
 
         except asyncio.CancelledError:
             break
+        except SessionExpiredError:
+            logger.warning("Session expired during notification poll — re-logging in…")
+            try:
+                await relogin(client, steam)
+            except Exception as exc:
+                logger.error("Re-login failed: %s", exc)
         except Exception as exc:
             logger.error("Notification poll error: %s", exc)
 
@@ -171,7 +236,14 @@ async def run_active_offers_checker(
         "Starting active-offers checker (interval=%ds)", CHECK_ACTIVE_OFFERS_INTERVAL
     )
     while not stop_event.is_set():
-        await process_active_offers(client, steam)
+        try:
+            await process_active_offers(client, steam)
+        except SessionExpiredError:
+            logger.warning("Session expired during offers check — re-logging in…")
+            try:
+                await relogin(client, steam)
+            except Exception as exc:
+                logger.error("Re-login failed: %s", exc)
         try:
             await asyncio.wait_for(
                 asyncio.shield(stop_event.wait()),
@@ -197,35 +269,51 @@ async def run(stop_event: asyncio.Event):
     await steam.login()
     logger.info("Steam login successful (steamId=%s)", steam.steam_id)
 
-    # 2. OpenID login to CS.Money using the Steam session cookies
-    loop = asyncio.get_event_loop()
-    csgo_ses = await loop.run_in_executor(
-        None,
-        functools.partial(
-            openid_login,
-            _steam_login_secure(steam),
-            steam.session_id,
-        ),
-    )
+    # 2. Try saved cookies; fall back to full OpenID login
+    cookies = _load_saved_cookies()
 
-    # 3. Run the CS.Money processing loop
     proxy = config.CSMONEY_PROXY or None
     async with primp.AsyncClient(
         impersonate="chrome_144",
         impersonate_os="windows",
         proxy=proxy,
     ) as http:
-        client = CsMoneyClient(http, csgo_ses)
+        client = CsMoneyClient(http, cookies)
 
-        # Verify credentials by checking user store on startup
-        try:
-            store = await client.get_user_store()
-            logger.info(
-                "Connected to CS.Money. Store status: %s", store.get("status", "?")
-            )
-        except Exception as exc:
-            logger.error("Startup check failed: %s", exc)
-            return
+        # Verify the session (saved or fresh); re-login if needed
+        if cookies:
+            try:
+                store = await client.get_user_store()
+                logger.info(
+                    "Resumed session from saved cookies. Store status: %s",
+                    store.get("status", "?"),
+                )
+            except SessionExpiredError:
+                logger.info("Saved cookies are expired — performing OpenID login…")
+                cookies = await _do_openid_login(steam)
+                client.update_cookies(cookies)
+                _save_cookies(cookies)
+                store = await client.get_user_store()
+                logger.info(
+                    "Connected to CS.Money. Store status: %s", store.get("status", "?")
+                )
+            except Exception as exc:
+                logger.error("Startup check failed: %s", exc)
+                return
+        else:
+            # No saved cookies — do a fresh OpenID login
+            logger.info("No saved cookies — performing OpenID login…")
+            try:
+                cookies = await _do_openid_login(steam)
+                client.update_cookies(cookies)
+                _save_cookies(cookies)
+                store = await client.get_user_store()
+                logger.info(
+                    "Connected to CS.Money. Store status: %s", store.get("status", "?")
+                )
+            except Exception as exc:
+                logger.error("Startup failed: %s", exc)
+                return
 
         # Run an initial active-offers check immediately
         await process_active_offers(client, steam)
