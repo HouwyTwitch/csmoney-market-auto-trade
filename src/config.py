@@ -1,25 +1,35 @@
-import os
+import json
 import logging
-from dotenv import load_dotenv
+from pathlib import Path
 
-load_dotenv()
+_CONFIG_PATH = Path(__file__).parent.parent / "config.json"
+
+_raw: dict = {}
+if _CONFIG_PATH.exists():
+    with _CONFIG_PATH.open() as _f:
+        _raw = json.load(_f)
+
+
+def _get(key: str, default=None):
+    return _raw.get(key, default)
+
 
 CSMONEY_BASE_URL = "https://cs.money"
 
 # Steam account credentials — used to log in via aiosteampy
-STEAM_USERNAME = os.getenv("STEAM_USERNAME", "")
-STEAM_PASSWORD = os.getenv("STEAM_PASSWORD", "")
-STEAM_SHARED_SECRET = os.getenv("STEAM_SHARED_SECRET", "")
+STEAM_USERNAME: str = _get("steam_username", "")
+STEAM_PASSWORD: str = _get("steam_password", "")
+STEAM_SHARED_SECRET: str = _get("steam_shared_secret", "")
 
 # Proxies (format: http://user:pass@host:port  or  http://host:port)
-# CSMONEY_PROXY is used for the cs.money session.
-# STEAM_PROXY is optional; falls back to CSMONEY_PROXY when not set.
-CSMONEY_PROXY = os.getenv("CSMONEY_PROXY", "")
-STEAM_PROXY = os.getenv("STEAM_PROXY", "") or CSMONEY_PROXY
+# csmoney_proxy is used for the cs.money session.
+# steam_proxy is optional; falls back to csmoney_proxy when not set.
+CSMONEY_PROXY: str = _get("csmoney_proxy", "")
+STEAM_PROXY: str = _get("steam_proxy", "") or CSMONEY_PROXY
 
-POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "10"))
+POLL_INTERVAL: float = float(_get("poll_interval", 10))
 
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+LOG_LEVEL: str = str(_get("log_level", "INFO")).upper()
 
 NOTIFICATIONS_LIMIT = 60
 
@@ -34,15 +44,22 @@ USER_AGENT = (
 
 
 def validate_config():
-    missing = []
-    if not STEAM_USERNAME:
-        missing.append("STEAM_USERNAME")
-    if not STEAM_PASSWORD:
-        missing.append("STEAM_PASSWORD")
-    if not STEAM_SHARED_SECRET:
-        missing.append("STEAM_SHARED_SECRET")
+    if not _CONFIG_PATH.exists():
+        raise FileNotFoundError(
+            f"config.json not found at {_CONFIG_PATH}. "
+            "Copy config.example.json to config.json and fill in your credentials."
+        )
+    missing = [
+        key
+        for key, val in [
+            ("steam_username", STEAM_USERNAME),
+            ("steam_password", STEAM_PASSWORD),
+            ("steam_shared_secret", STEAM_SHARED_SECRET),
+        ]
+        if not val
+    ]
     if missing:
-        raise ValueError(f"Missing required environment variables: {', '.join(missing)}")
+        raise ValueError(f"Missing required config.json fields: {', '.join(missing)}")
 
 
 def setup_logging():

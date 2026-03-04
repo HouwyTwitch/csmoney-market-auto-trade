@@ -1,0 +1,11 @@
+{
+    "steam_username": "",
+    "steam_password": "",
+    "steam_shared_secret": "",
+
+    "csmoney_proxy": "",
+    "steam_proxy": "",
+
+    "poll_interval": 10,
+    "log_level": "INFO"
+}
