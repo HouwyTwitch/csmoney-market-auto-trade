@@ -1,0 +1,1 @@
+# csmoney-market-auto-trade
