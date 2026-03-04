@@ -16,8 +16,6 @@ STEAM_SESSION_ID = os.getenv("STEAM_SESSION_ID", "")
 CSMONEY_PROXY = os.getenv("CSMONEY_PROXY", "")
 STEAM_PROXY = os.getenv("STEAM_PROXY", "") or CSMONEY_PROXY
 
-# Cloudflare cf_clearance cookie value (optional, needed on some IPs)
-CF_CLEARANCE = os.getenv("CF_CLEARANCE", "")
 
 POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "10"))
 

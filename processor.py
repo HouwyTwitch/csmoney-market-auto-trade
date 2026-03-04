@@ -16,7 +16,7 @@ import asyncio
 import logging
 import time
 
-import aiohttp
+import primp
 
 import config
 from csmoney_client import CsMoneyClient
@@ -144,9 +144,13 @@ async def run(stop_event: asyncio.Event):
 
     csgo_ses = await asyncio.get_event_loop().run_in_executor(None, openid_login)
 
-    connector = aiohttp.TCPConnector(ssl=True)
-    async with aiohttp.ClientSession(connector=connector) as session:
-        client = CsMoneyClient(session, csgo_ses)
+    proxy = config.CSMONEY_PROXY or None
+    async with primp.AsyncClient(
+        impersonate="chrome_144",
+        impersonate_os="windows",
+        proxy=proxy,
+    ) as http:
+        client = CsMoneyClient(http, csgo_ses)
 
         # Verify credentials by checking user store on startup
         try:

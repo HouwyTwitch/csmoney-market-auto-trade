@@ -63,8 +63,6 @@ def _make_csmoney_session() -> Session:
             "http": config.CSMONEY_PROXY,
             "https": config.CSMONEY_PROXY,
         }
-    if config.CF_CLEARANCE:
-        session.cookies.update({"cf_clearance": config.CF_CLEARANCE})
     return session
 
 
