@@ -1,0 +1,52 @@
+{
+"update_url": "https://clients2.google.com/service/update2/crx",
+
+  "name": "CS.Money Market",
+  "description": "The power of CS.Money Market extension",
+  "version": "4.0.0",
+  "manifest_version": 3,
+  "action": {
+    "default_popup": "index.html",
+    "default_title": "Open market"
+  },
+  "icons": {
+    "16": "logo16x16.png",
+    "48": "logo48x48.png",
+    "128": "logo128x128.png"
+  },
+  "background": {
+    "service_worker": "static/js/serviceWorker.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://*.cs.money/*",
+        "https://*.csmoney.money/*",
+        "https://*.1cs.money/*",
+        "https://*.3cs.money/*"
+      ],
+      "js": [
+        "static/js/createExtensionIdentifier.js"
+      ]
+    }
+  ],
+  "host_permissions": [
+    "*://steamcommunity.com/",
+    "*://api.steampowered.com/",
+    "*://steamcommunity-a.akamaihd.net/",
+    "*://cs.money/",
+    "*://csmoney.money/",
+    "*://1cs.money/",
+    "*://3cs.money/"
+  ],
+  "permissions": [
+    "cookies",
+    "declarativeNetRequest",
+    "alarms",
+    "notifications",
+    "storage",
+    "webNavigation",
+    "tabs"
+  ]
+}
