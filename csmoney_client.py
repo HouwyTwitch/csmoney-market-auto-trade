@@ -1,5 +1,4 @@
 import logging
-import time
 from typing import Optional
 
 import aiohttp
@@ -27,16 +26,11 @@ def _build_headers(extra: Optional[dict] = None) -> dict:
     return headers
 
 
-def _build_cookies() -> dict:
-    return {
-        "csgo_ses": config.CSMONEY_SESSION,
-    }
-
-
 class CsMoneyClient:
-    def __init__(self, session: aiohttp.ClientSession):
+    def __init__(self, session: aiohttp.ClientSession, csgo_ses: str):
         self._session = session
         self._base = config.CSMONEY_BASE_URL
+        self._cookies = {"csgo_ses": csgo_ses}
 
     async def get_notifications(self, updated_from: int) -> dict:
         url = (
@@ -45,7 +39,7 @@ class CsMoneyClient:
         )
         headers = _build_headers({"x-client-app": "web"})
         async with self._session.get(
-            url, headers=headers, cookies=_build_cookies()
+            url, headers=headers, cookies=self._cookies
         ) as resp:
             resp.raise_for_status()
             return await resp.json()
@@ -62,7 +56,7 @@ class CsMoneyClient:
         async with self._session.post(
             url,
             headers=headers,
-            cookies=_build_cookies(),
+            cookies=self._cookies,
             json={"notificationsIds": notification_ids},
         ) as resp:
             resp.raise_for_status()
@@ -76,7 +70,7 @@ class CsMoneyClient:
             }
         )
         async with self._session.get(
-            url, headers=headers, cookies=_build_cookies()
+            url, headers=headers, cookies=self._cookies
         ) as resp:
             resp.raise_for_status()
             return await resp.json()
@@ -91,7 +85,7 @@ class CsMoneyClient:
             }
         )
         async with self._session.post(
-            url, headers=headers, cookies=_build_cookies(), data=b""
+            url, headers=headers, cookies=self._cookies, data=b""
         ) as resp:
             resp.raise_for_status()
             return await resp.json()
@@ -114,7 +108,7 @@ class CsMoneyClient:
         async with self._session.post(
             url,
             headers=headers,
-            cookies=_build_cookies(),
+            cookies=self._cookies,
             json=payload,
         ) as resp:
             resp.raise_for_status()
@@ -124,7 +118,7 @@ class CsMoneyClient:
         url = f"{self._base}/1.0/market/user-store"
         headers = _build_headers({"x-client-app": "web"})
         async with self._session.get(
-            url, headers=headers, cookies=_build_cookies()
+            url, headers=headers, cookies=self._cookies
         ) as resp:
             resp.raise_for_status()
             return await resp.json()

@@ -20,6 +20,7 @@ import aiohttp
 
 import config
 from csmoney_client import CsMoneyClient
+from openid_auth import openid_login
 from session_crypto import encrypt_message
 
 logger = logging.getLogger(__name__)
@@ -141,9 +142,11 @@ async def run_active_offers_checker(client: CsMoneyClient, stop_event: asyncio.E
 async def run(stop_event: asyncio.Event):
     config.validate_config()
 
+    csgo_ses = await asyncio.get_event_loop().run_in_executor(None, openid_login)
+
     connector = aiohttp.TCPConnector(ssl=True)
     async with aiohttp.ClientSession(connector=connector) as session:
-        client = CsMoneyClient(session)
+        client = CsMoneyClient(session, csgo_ses)
 
         # Verify credentials by checking user store on startup
         try:
