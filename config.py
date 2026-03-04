@@ -6,9 +6,16 @@ load_dotenv()
 
 CSMONEY_BASE_URL = "https://cs.money"
 
-CSMONEY_SESSION = os.getenv("CSMONEY_SESSION", "")
+# Steam credentials — used to build the Steam curl_cffi session for OpenID
 STEAM_LOGIN_SECURE = os.getenv("STEAM_LOGIN_SECURE", "")
 STEAM_SESSION_ID = os.getenv("STEAM_SESSION_ID", "")
+
+# Proxies (format: http://user:pass@host:port  or  http://host:port)
+# CSMONEY_PROXY is used for the cs.money session.
+# STEAM_PROXY is optional; falls back to CSMONEY_PROXY when not set.
+CSMONEY_PROXY = os.getenv("CSMONEY_PROXY", "")
+STEAM_PROXY = os.getenv("STEAM_PROXY", "") or CSMONEY_PROXY
+
 
 POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "10"))
 
@@ -19,11 +26,15 @@ NOTIFICATIONS_LIMIT = 60
 EXTENSION_VERSION = "4.0.0"
 EXTENSION_ID = "mkjknmlmebnimmkonggecjlccealonel"
 
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/144.0.0.0 Safari/537.36"
+)
+
 
 def validate_config():
     missing = []
-    if not CSMONEY_SESSION:
-        missing.append("CSMONEY_SESSION")
     if not STEAM_LOGIN_SECURE:
         missing.append("STEAM_LOGIN_SECURE")
     if not STEAM_SESSION_ID:
