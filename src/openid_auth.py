@@ -80,10 +80,7 @@ def _extract_openid_fields(html: str) -> dict:
     fields = {}
     for name in _OPENID_FIELDS:
         marker = f'name="{name}" value="'
-        if marker in html:
-            fields[name] = (None, html.split(marker)[-1].split('"')[0])
-        else:
-            fields[name] = (None, "")
+        fields[name] = html.split(marker)[-1].split('"')[0] if marker in html else ""
     return fields
 
 
@@ -100,7 +97,7 @@ def _submit_openid(steam_session: Session, auth_link: str) -> str:
     )
     response = steam_session.post(
         _STEAM_OPENID_URL,
-        files=fields,
+        data=fields,
         allow_redirects=False,
     )
     location = response.headers.get("Location", "")
