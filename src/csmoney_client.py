@@ -3,7 +3,7 @@ from typing import Optional
 
 import primp
 
-import config
+from . import config
 
 logger = logging.getLogger(__name__)
 
