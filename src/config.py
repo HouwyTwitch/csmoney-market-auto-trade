@@ -20,6 +20,7 @@ CSMONEY_BASE_URL = "https://cs.money"
 STEAM_USERNAME: str = _get("steam_username", "")
 STEAM_PASSWORD: str = _get("steam_password", "")
 STEAM_SHARED_SECRET: str = _get("steam_shared_secret", "")
+STEAM_IDENTITY_SECRET: str = _get("steam_identity_secret", "")
 
 # Proxies (format: http://user:pass@host:port  or  http://host:port)
 # csmoney_proxy is used for the cs.money session.
@@ -55,6 +56,7 @@ def validate_config():
             ("steam_username", STEAM_USERNAME),
             ("steam_password", STEAM_PASSWORD),
             ("steam_shared_secret", STEAM_SHARED_SECRET),
+            ("steam_identity_secret", STEAM_IDENTITY_SECRET),
         ]
         if not val
     ]

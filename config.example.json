@@ -2,6 +2,7 @@
     "steam_username": "",
     "steam_password": "",
     "steam_shared_secret": "",
+    "steam_identity_secret": "",
 
     "csmoney_proxy": "",
     "steam_proxy": "",

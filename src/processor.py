@@ -19,6 +19,7 @@ import time
 
 import primp
 from aiosteampy import SteamClient
+from aiosteampy.models import ConfirmationType
 
 from . import config
 from .csmoney_client import CsMoneyClient
@@ -29,6 +30,7 @@ logger = logging.getLogger(__name__)
 
 OFFER_BOUGHT = "OFFER_BOUGHT"
 CHECK_ACTIVE_OFFERS_INTERVAL = 360  # 6 minutes, same as extension alarm
+CONFIRMATION_INTERVAL = 15  # seconds between confirmation polls
 
 
 def _steam_login_secure(steam: SteamClient) -> str:
@@ -138,6 +140,29 @@ async def run_notification_poller(
             pass
 
 
+async def run_confirmation_poller(steam: SteamClient, stop_event: asyncio.Event):
+    """Periodically fetch and auto-confirm pending Steam trade confirmations."""
+    logger.info(
+        "Starting confirmation poller (interval=%ds)", CONFIRMATION_INTERVAL
+    )
+    while not stop_event.is_set():
+        try:
+            confs = await steam.get_confirmations()
+            trade_confs = [c for c in confs if c.type is ConfirmationType.TRADE]
+            if trade_confs:
+                await steam.allow_multiple_confirmations(trade_confs)
+                logger.info("Auto-confirmed %d trade confirmation(s).", len(trade_confs))
+        except Exception as exc:
+            logger.error("Confirmation poll error: %s", exc)
+
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(stop_event.wait()), timeout=CONFIRMATION_INTERVAL
+            )
+        except asyncio.TimeoutError:
+            pass
+
+
 async def run_active_offers_checker(
     client: CsMoneyClient, steam: SteamClient, stop_event: asyncio.Event
 ):
@@ -164,6 +189,7 @@ async def run(stop_event: asyncio.Event):
         config.STEAM_USERNAME,
         config.STEAM_PASSWORD,
         shared_secret=config.STEAM_SHARED_SECRET,
+        identity_secret=config.STEAM_IDENTITY_SECRET,
         proxy=config.STEAM_PROXY or None,
     )
     logger.info("Logging in to Steam as %s…", config.STEAM_USERNAME)
@@ -206,4 +232,5 @@ async def run(stop_event: asyncio.Event):
         await asyncio.gather(
             run_notification_poller(client, steam, stop_event),
             run_active_offers_checker(client, steam, stop_event),
+            run_confirmation_poller(steam, stop_event),
         )
