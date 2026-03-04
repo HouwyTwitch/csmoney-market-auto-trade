@@ -3,14 +3,16 @@ CS.Money OpenID authentication via Steam.
 
 Flow:
   1. GET auth.dota.trade/login  → redirects to Steam OpenID URL
-  2. GET Steam OpenID page
-       a. If Steam auto-approves (already logged in) → 302 directly to callback URL
-       b. If Steam shows approval form → extract fields, POST, get callback URL
+  2. GET Steam OpenID page (allow_redirects=True to absorb CDN/Akamai hops)
+       a. Final URL still on steamcommunity.com → extract hidden form fields,
+          POST to /openid/login (multipart) → 302 to cs.money callback
+       b. Final URL off Steam → Steam auto-approved, use it directly as callback
   3. GET cs.money callback (via csmoney_session) → sets csgo_ses cookie
 """
 
 import logging
 
+from curl_cffi import CurlMime
 from curl_cffi.requests import Session
 
 from . import config
@@ -85,32 +87,41 @@ def _extract_openid_fields(html: str) -> dict:
     return fields
 
 
+def _build_multipart(fields: dict) -> CurlMime:
+    m = CurlMime()
+    for name, value in fields.items():
+        m.addpart(name=name, data=value.encode())
+    return m
+
+
 def _submit_openid(steam_session: Session, auth_link: str) -> str:
-    response = steam_session.get(auth_link, allow_redirects=False)
-    logger.debug("Steam OpenID GET status: %d", response.status_code)
+    # Follow redirects so Akamai CDN hops are transparent; land on the actual form.
+    response = steam_session.get(auth_link)
+    final_url = response.url
+    logger.debug("Steam OpenID GET ended at: %s (status: %d)", final_url, response.status_code)
 
-    # When already logged in Steam may auto-approve and redirect straight to the
-    # callback URL without showing the form — use that redirect directly.
-    if response.status_code in (301, 302, 303, 307, 308):
-        location = response.headers.get("Location", "")
-        if location:
-            logger.debug("Steam auto-redirected to callback: %s", location)
-            return location
+    # If Steam auto-approved and redirected off-domain, that IS the callback URL.
+    if "steamcommunity.com" not in final_url:
+        logger.debug("Steam auto-approved, callback: %s", final_url)
+        return final_url
 
-    # Approval form shown — extract hidden fields and POST them.
+    # We landed on the approval form — extract hidden fields and POST.
     content = response.content.decode("utf-8", errors="ignore")
     fields = _extract_openid_fields(content)
-    logger.debug("OpenID form fields: %s", fields)
+    logger.debug(
+        "OpenID form fields: %s",
+        {k: (v[:30] + "…" if len(v) > 30 else v) for k, v in fields.items()},
+    )
 
     steam_session.headers.update(
         {
             "Origin": "https://steamcommunity.com",
-            "Referer": auth_link,
+            "Referer": final_url,
         }
     )
     response = steam_session.post(
         _STEAM_OPENID_URL,
-        data=fields,
+        multipart=_build_multipart(fields),
         allow_redirects=False,
     )
     logger.debug("Steam OpenID POST status: %d", response.status_code)
