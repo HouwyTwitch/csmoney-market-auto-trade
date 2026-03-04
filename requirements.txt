@@ -1,3 +1,4 @@
+aiosteampy>=0.7.0
 cryptography>=41.0.0
 curl_cffi>=0.7.0
 primp>=1.1.0

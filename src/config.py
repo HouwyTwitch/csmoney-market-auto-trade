@@ -6,16 +6,16 @@ load_dotenv()
 
 CSMONEY_BASE_URL = "https://cs.money"
 
-# Steam credentials — used to build the Steam curl_cffi session for OpenID
-STEAM_LOGIN_SECURE = os.getenv("STEAM_LOGIN_SECURE", "")
-STEAM_SESSION_ID = os.getenv("STEAM_SESSION_ID", "")
+# Steam account credentials — used to log in via aiosteampy
+STEAM_USERNAME = os.getenv("STEAM_USERNAME", "")
+STEAM_PASSWORD = os.getenv("STEAM_PASSWORD", "")
+STEAM_SHARED_SECRET = os.getenv("STEAM_SHARED_SECRET", "")
 
 # Proxies (format: http://user:pass@host:port  or  http://host:port)
 # CSMONEY_PROXY is used for the cs.money session.
 # STEAM_PROXY is optional; falls back to CSMONEY_PROXY when not set.
 CSMONEY_PROXY = os.getenv("CSMONEY_PROXY", "")
 STEAM_PROXY = os.getenv("STEAM_PROXY", "") or CSMONEY_PROXY
-
 
 POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "10"))
 
@@ -35,10 +35,12 @@ USER_AGENT = (
 
 def validate_config():
     missing = []
-    if not STEAM_LOGIN_SECURE:
-        missing.append("STEAM_LOGIN_SECURE")
-    if not STEAM_SESSION_ID:
-        missing.append("STEAM_SESSION_ID")
+    if not STEAM_USERNAME:
+        missing.append("STEAM_USERNAME")
+    if not STEAM_PASSWORD:
+        missing.append("STEAM_PASSWORD")
+    if not STEAM_SHARED_SECRET:
+        missing.append("STEAM_SHARED_SECRET")
     if missing:
         raise ValueError(f"Missing required environment variables: {', '.join(missing)}")
 

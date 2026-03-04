@@ -13,15 +13,17 @@ Flow (mirrors the CS.Money Chrome extension service worker):
 """
 
 import asyncio
+import functools
 import logging
 import time
 
 import primp
+from aiosteampy import SteamClient
 
-import config
-from csmoney_client import CsMoneyClient
-from openid_auth import openid_login
-from session_crypto import encrypt_message
+from . import config
+from .csmoney_client import CsMoneyClient
+from .openid_auth import openid_login
+from .session_crypto import encrypt_message
 
 logger = logging.getLogger(__name__)
 
@@ -29,16 +31,25 @@ OFFER_BOUGHT = "OFFER_BOUGHT"
 CHECK_ACTIVE_OFFERS_INTERVAL = 360  # 6 minutes, same as extension alarm
 
 
-async def send_steam_session(client: CsMoneyClient) -> None:
+def _steam_login_secure(steam: SteamClient) -> str:
+    """Return the full steamLoginSecure cookie value: {steamId}%7C%7C{accessToken}."""
+    return f"{steam.steam_id}%7C%7C{steam.access_token}"
+
+
+async def send_steam_session(client: CsMoneyClient, steam: SteamClient) -> None:
     """Encrypt Steam cookies and submit them to CS.Money."""
     logger.info("Sending Steam session to CS.Money...")
     try:
+        if steam.is_access_token_expired:
+            logger.info("Steam access token expired — refreshing…")
+            await steam.refresh_access_token()
+
         key_info = await client.get_security_key()
         public_key = key_info["publicKey"]
         correlation_id = key_info["correlationId"]
 
-        encrypted_session_data = encrypt_message(public_key, config.STEAM_LOGIN_SECURE)
-        encrypted_session_id = encrypt_message(public_key, config.STEAM_SESSION_ID)
+        encrypted_session_data = encrypt_message(public_key, _steam_login_secure(steam))
+        encrypted_session_id = encrypt_message(public_key, steam.session_id)
 
         await client.send_session(
             session_id=encrypted_session_id,
@@ -50,7 +61,7 @@ async def send_steam_session(client: CsMoneyClient) -> None:
         logger.error("Failed to send Steam session: %s", exc)
 
 
-async def process_active_offers(client: CsMoneyClient) -> None:
+async def process_active_offers(client: CsMoneyClient, steam: SteamClient) -> None:
     """Check active offers and send session if CS.Money requests it."""
     try:
         data = await client.get_active_offers()
@@ -65,19 +76,21 @@ async def process_active_offers(client: CsMoneyClient) -> None:
             logger.info(
                 "historyOutdate=true — CS.Money needs Steam session to process trades."
             )
-            await send_steam_session(client)
+            await send_steam_session(client, steam)
         elif offers:
             creating = [o for o in offers if o.get("status") == "CREATING"]
             if creating:
                 logger.info(
                     "%d offer(s) in CREATING state — sending Steam session.", len(creating)
                 )
-                await send_steam_session(client)
+                await send_steam_session(client, steam)
     except Exception as exc:
         logger.error("Error checking active offers: %s", exc)
 
 
-async def handle_notification(client: CsMoneyClient, notification: dict) -> None:
+async def handle_notification(
+    client: CsMoneyClient, steam: SteamClient, notification: dict
+) -> None:
     ntype = notification.get("type")
     nid = notification.get("id")
     item_name = notification.get("data", {}).get("item", {}).get("name", "unknown item")
@@ -88,12 +101,14 @@ async def handle_notification(client: CsMoneyClient, notification: dict) -> None
             await client.mark_notifications_viewed([nid])
         except Exception as exc:
             logger.warning("Could not mark notification %s as viewed: %s", nid, exc)
-        await process_active_offers(client)
+        await process_active_offers(client, steam)
     else:
         logger.debug("Ignoring notification type=%s id=%s", ntype, nid)
 
 
-async def run_notification_poller(client: CsMoneyClient, stop_event: asyncio.Event):
+async def run_notification_poller(
+    client: CsMoneyClient, steam: SteamClient, stop_event: asyncio.Event
+):
     """Poll the notifications endpoint continuously."""
     updated_from = int(time.time() * 1000)
     logger.info("Starting notification poller (updatedFrom=%d)", updated_from)
@@ -105,7 +120,7 @@ async def run_notification_poller(client: CsMoneyClient, stop_event: asyncio.Eve
 
             for n in notifications:
                 updated_from = max(updated_from, n.get("date", 0) + 1)
-                await handle_notification(client, n)
+                await handle_notification(client, steam, n)
 
             if not notifications:
                 updated_from = int(time.time() * 1000)
@@ -123,13 +138,15 @@ async def run_notification_poller(client: CsMoneyClient, stop_event: asyncio.Eve
             pass
 
 
-async def run_active_offers_checker(client: CsMoneyClient, stop_event: asyncio.Event):
+async def run_active_offers_checker(
+    client: CsMoneyClient, steam: SteamClient, stop_event: asyncio.Event
+):
     """Periodically check active offers independent of notifications."""
     logger.info(
         "Starting active-offers checker (interval=%ds)", CHECK_ACTIVE_OFFERS_INTERVAL
     )
     while not stop_event.is_set():
-        await process_active_offers(client)
+        await process_active_offers(client, steam)
         try:
             await asyncio.wait_for(
                 asyncio.shield(stop_event.wait()),
@@ -142,8 +159,29 @@ async def run_active_offers_checker(client: CsMoneyClient, stop_event: asyncio.E
 async def run(stop_event: asyncio.Event):
     config.validate_config()
 
-    csgo_ses = await asyncio.get_event_loop().run_in_executor(None, openid_login)
+    # 1. Login to Steam via aiosteampy
+    steam = SteamClient(
+        config.STEAM_USERNAME,
+        config.STEAM_PASSWORD,
+        shared_secret=config.STEAM_SHARED_SECRET,
+        proxy=config.STEAM_PROXY or None,
+    )
+    logger.info("Logging in to Steam as %s…", config.STEAM_USERNAME)
+    await steam.login()
+    logger.info("Steam login successful (steamId=%s)", steam.steam_id)
 
+    # 2. OpenID login to CS.Money using the Steam session cookies
+    loop = asyncio.get_event_loop()
+    csgo_ses = await loop.run_in_executor(
+        None,
+        functools.partial(
+            openid_login,
+            _steam_login_secure(steam),
+            steam.session_id,
+        ),
+    )
+
+    # 3. Run the CS.Money processing loop
     proxy = config.CSMONEY_PROXY or None
     async with primp.AsyncClient(
         impersonate="chrome_144",
@@ -163,9 +201,9 @@ async def run(stop_event: asyncio.Event):
             return
 
         # Run an initial active-offers check immediately
-        await process_active_offers(client)
+        await process_active_offers(client, steam)
 
         await asyncio.gather(
-            run_notification_poller(client, stop_event),
-            run_active_offers_checker(client, stop_event),
+            run_notification_poller(client, steam, stop_event),
+            run_active_offers_checker(client, steam, stop_event),
         )

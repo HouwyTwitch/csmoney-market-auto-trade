@@ -12,7 +12,7 @@ import logging
 
 from curl_cffi.requests import Session
 
-import config
+from . import config
 
 logger = logging.getLogger(__name__)
 
@@ -25,13 +25,13 @@ _STEAM_OPENID_URL = "https://steamcommunity.com/openid/login"
 _OPENID_FIELDS = ["openidparams", "openid.mode", "action", "nonce"]
 
 
-def _make_steam_session() -> Session:
+def _make_steam_session(steam_login_secure: str, session_id: str) -> Session:
     session = Session(impersonate="chrome136", http_version=2, verify=False)
     session.headers.update({"user-agent": config.USER_AGENT})
     session.cookies.update(
         {
-            "steamLoginSecure": config.STEAM_LOGIN_SECURE,
-            "sessionid": config.STEAM_SESSION_ID,
+            "steamLoginSecure": steam_login_secure,
+            "sessionid": session_id,
         }
     )
     if config.STEAM_PROXY:
@@ -111,13 +111,13 @@ def _submit_openid(steam_session: Session, auth_link: str) -> str:
     return location
 
 
-def openid_login(login_url: str = _LOGIN_URL) -> str:
+def openid_login(steam_login_secure: str, session_id: str, login_url: str = _LOGIN_URL) -> str:
     """
     Run the full OpenID flow and return the csgo_ses cookie value.
     """
     logger.info("Starting CS.Money OpenID login…")
 
-    steam_session = _make_steam_session()
+    steam_session = _make_steam_session(steam_login_secure, session_id)
     csmoney_session = _make_csmoney_session()
 
     auth_link = _get_auth_link(csmoney_session, login_url)
