@@ -127,9 +127,10 @@ async def process_active_offers(client: CsMoneyClient, steam: SteamClient) -> No
         offers = data.get("activeOffers", [])
         history_outdate = data.get("historyOutdate", False)
 
-        logger.debug(
-            "Active offers: %d | historyOutdate: %s", len(offers), history_outdate
+        logger.info(
+            "Active offers: count=%d historyOutdate=%s", len(offers), history_outdate
         )
+        logger.debug("Active offers full response: %s", data)
 
         if history_outdate:
             logger.info(
@@ -213,12 +214,18 @@ async def run_confirmation_poller(steam: SteamClient, stop_event: asyncio.Event)
     while not stop_event.is_set():
         try:
             confs = await steam.get_confirmations()
+            if confs:
+                logger.info(
+                    "Pending confirmations: total=%d types=%s",
+                    len(confs),
+                    [c.type.name for c in confs],
+                )
             trade_confs = [c for c in confs if c.type is ConfirmationType.TRADE]
             if trade_confs:
                 await steam.allow_multiple_confirmations(trade_confs)
                 logger.info("Auto-confirmed %d trade confirmation(s).", len(trade_confs))
         except Exception as exc:
-            logger.error("Confirmation poll error: %s", exc)
+            logger.error("Confirmation poll error: %s", exc, exc_info=True)
 
         try:
             await asyncio.wait_for(
