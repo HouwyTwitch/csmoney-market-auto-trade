@@ -17,6 +17,7 @@ def _get(key: str, default=None):
 CSMONEY_BASE_URL = "https://cs.money"
 
 # Steam account credentials — used to log in via aiosteampy
+STEAM_ID: int = int(_get("steam_id", 0))
 STEAM_USERNAME: str = _get("steam_username", "")
 STEAM_PASSWORD: str = _get("steam_password", "")
 STEAM_SHARED_SECRET: str = _get("steam_shared_secret", "")
@@ -53,6 +54,7 @@ def validate_config():
     missing = [
         key
         for key, val in [
+            ("steam_id", STEAM_ID),
             ("steam_username", STEAM_USERNAME),
             ("steam_password", STEAM_PASSWORD),
             ("steam_shared_secret", STEAM_SHARED_SECRET),
