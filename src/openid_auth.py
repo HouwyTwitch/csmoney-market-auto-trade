@@ -3,9 +3,10 @@ CS.Money OpenID authentication via Steam.
 
 Flow:
   1. GET auth.dota.trade/login  → redirects to Steam OpenID URL
-  2. GET Steam OpenID page      → extract hidden form fields
-  3. POST steamcommunity.com/openid/login → redirects to cs.money callback
-  4. GET cs.money callback       → sets csgo_ses session cookie
+  2. GET Steam OpenID page
+       a. If Steam auto-approves (already logged in) → 302 directly to callback URL
+       b. If Steam shows approval form → extract fields, POST, get callback URL
+  3. GET cs.money callback (via csmoney_session) → sets csgo_ses cookie
 """
 
 import logging
@@ -86,8 +87,20 @@ def _extract_openid_fields(html: str) -> dict:
 
 def _submit_openid(steam_session: Session, auth_link: str) -> str:
     response = steam_session.get(auth_link, allow_redirects=False)
+    logger.debug("Steam OpenID GET status: %d", response.status_code)
+
+    # When already logged in Steam may auto-approve and redirect straight to the
+    # callback URL without showing the form — use that redirect directly.
+    if response.status_code in (301, 302, 303, 307, 308):
+        location = response.headers.get("Location", "")
+        if location:
+            logger.debug("Steam auto-redirected to callback: %s", location)
+            return location
+
+    # Approval form shown — extract hidden fields and POST them.
     content = response.content.decode("utf-8", errors="ignore")
     fields = _extract_openid_fields(content)
+    logger.debug("OpenID form fields: %s", fields)
 
     steam_session.headers.update(
         {
@@ -100,6 +113,7 @@ def _submit_openid(steam_session: Session, auth_link: str) -> str:
         data=fields,
         allow_redirects=False,
     )
+    logger.debug("Steam OpenID POST status: %d", response.status_code)
     location = response.headers.get("Location", "")
     if not location:
         raise RuntimeError(
@@ -121,14 +135,20 @@ def openid_login(steam_login_secure: str, session_id: str, login_url: str = _LOG
     logger.debug("Steam OpenID URL: %s", auth_link)
 
     csmoney_callback = _submit_openid(steam_session, auth_link)
-    logger.debug("CS.Money callback URL: %s", csmoney_callback)
+    logger.info("CS.Money callback URL: %s", csmoney_callback)
 
     csmoney_session.get(csmoney_callback)
+
+    logger.debug(
+        "Cookies after callback: %s",
+        {k: v for k, v in csmoney_session.cookies.items()},
+    )
 
     csgo_ses = csmoney_session.cookies.get("csgo_ses")
     if not csgo_ses:
         raise RuntimeError(
-            "OpenID login failed — 'csgo_ses' cookie not present after callback"
+            "OpenID login failed — 'csgo_ses' cookie not present after callback. "
+            "Set LOG_LEVEL=DEBUG for full diagnostic output."
         )
 
     logger.info("OpenID login successful.")
