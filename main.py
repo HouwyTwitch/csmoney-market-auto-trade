@@ -4,8 +4,8 @@
 import asyncio
 import signal
 
-import config
-from processor import run
+from src import config
+from src.processor import run
 
 config.setup_logging()
 
