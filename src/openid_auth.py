@@ -133,9 +133,12 @@ def _submit_openid(steam_session: Session, auth_link: str) -> str:
     return location
 
 
-def openid_login(steam_login_secure: str, session_id: str, login_url: str = _LOGIN_URL) -> str:
+def openid_login(
+    steam_login_secure: str, session_id: str, login_url: str = _LOGIN_URL
+) -> dict:
     """
-    Run the full OpenID flow and return the csgo_ses cookie value.
+    Run the full OpenID flow and return all CS.Money cookies as a dict.
+    The dict is guaranteed to contain the 'csgo_ses' key.
     """
     logger.info("Starting CS.Money OpenID login…")
 
@@ -150,17 +153,14 @@ def openid_login(steam_login_secure: str, session_id: str, login_url: str = _LOG
 
     csmoney_session.get(csmoney_callback)
 
-    logger.debug(
-        "Cookies after callback: %s",
-        {k: v for k, v in csmoney_session.cookies.items()},
-    )
+    cookies = dict(csmoney_session.cookies)
+    logger.debug("Cookies after callback: %s", list(cookies.keys()))
 
-    csgo_ses = csmoney_session.cookies.get("csgo_ses")
-    if not csgo_ses:
+    if not cookies.get("csgo_ses"):
         raise RuntimeError(
             "OpenID login failed — 'csgo_ses' cookie not present after callback. "
             "Set LOG_LEVEL=DEBUG for full diagnostic output."
         )
 
     logger.info("OpenID login successful.")
-    return csgo_ses
+    return cookies
