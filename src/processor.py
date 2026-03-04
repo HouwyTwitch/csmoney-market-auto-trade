@@ -186,9 +186,10 @@ async def run(stop_event: asyncio.Event):
 
     # 1. Login to Steam via aiosteampy
     steam = SteamClient(
+        config.STEAM_ID,
         config.STEAM_USERNAME,
         config.STEAM_PASSWORD,
-        shared_secret=config.STEAM_SHARED_SECRET,
+        config.STEAM_SHARED_SECRET,
         identity_secret=config.STEAM_IDENTITY_SECRET,
         proxy=config.STEAM_PROXY or None,
     )
