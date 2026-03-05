@@ -24,17 +24,24 @@ The real flow (reverse-engineered from the CS.Money Chrome extension):
 Cookie persistence:
   Cookies written to csmoney_cookies.json after each login.
   Saved cookies tried first on startup; re-login only if expired.
+
+Steam session persistence:
+  The refresh token (valid ~2 years) is saved to steam_session.json after
+  first login.  Subsequent startups restore the token and call
+  refresh_access_token() — no password/2FA round-trip needed.
 """
 
 import asyncio
 import functools
 import json
 import logging
+import secrets
 import time
 from pathlib import Path
 
 import primp
 from aiosteampy import SteamClient
+from aiosteampy.constants import STEAM_URL
 from aiosteampy.models import ConfirmationType
 
 from . import config
@@ -50,8 +57,66 @@ CHECK_ACTIVE_OFFERS_INTERVAL = 30   # seconds; extension uses 6 min alarms but w
 CONFIRMATION_INTERVAL = 15          # seconds between confirmation polls
 
 _COOKIE_FILE = Path("csmoney_cookies.json")
+_STEAM_SESSION_FILE = Path("steam_session.json")
 
-# ── cookie persistence ────────────────────────────────────────────────────────
+# ── Steam session persistence ─────────────────────────────────────────────────
+
+def _load_steam_session() -> dict:
+    if _STEAM_SESSION_FILE.exists():
+        try:
+            return json.loads(_STEAM_SESSION_FILE.read_text())
+        except Exception as exc:
+            logger.warning("Could not read %s: %s", _STEAM_SESSION_FILE, exc)
+    return {}
+
+
+def _save_steam_session(steam: SteamClient) -> None:
+    try:
+        data = {
+            "refresh_token": steam.get_refresh_token(),
+            "session_id": steam.session_id,
+        }
+        _STEAM_SESSION_FILE.write_text(json.dumps(data))
+        logger.debug("Steam session saved to %s", _STEAM_SESSION_FILE)
+    except Exception as exc:
+        logger.warning("Could not save Steam session: %s", exc)
+
+
+async def _steam_login(steam: SteamClient) -> None:
+    """
+    Login to Steam, reusing a saved refresh token if available.
+    Falls back to full username/password login when the saved token is
+    missing, expired, or fails to refresh.
+    """
+    saved = _load_steam_session()
+    refresh_token = saved.get("refresh_token")
+    session_id = saved.get("session_id")
+
+    if refresh_token:
+        try:
+            steam.set_refresh_token(refresh_token)
+            if steam.is_refresh_token_expired:
+                raise ValueError("Refresh token expired")
+            logger.info("Restoring Steam session from saved refresh token…")
+            await steam.refresh_access_token()
+            # Restore (or generate) a session ID
+            if session_id:
+                steam.set_session_id(STEAM_URL.COMMUNITY, session_id)
+            else:
+                steam.set_session_id(STEAM_URL.COMMUNITY, secrets.token_hex(12))
+            logger.info("Steam session restored (steamId=%s)", steam.steam_id)
+            _save_steam_session(steam)
+            return
+        except Exception as exc:
+            logger.warning("Could not restore Steam session (%s) — doing full login.", exc)
+
+    logger.info("Logging in to Steam as %s…", config.STEAM_USERNAME)
+    await steam.login()
+    logger.info("Steam login successful (steamId=%s)", steam.steam_id)
+    _save_steam_session(steam)
+
+
+# ── CS.Money cookie persistence ───────────────────────────────────────────────
 
 def _load_saved_cookies() -> dict:
     if _COOKIE_FILE.exists():
@@ -89,9 +154,11 @@ async def _do_openid_login(steam: SteamClient) -> dict:
 
 
 async def relogin(client: CsMoneyClient, steam: SteamClient) -> None:
+    """Re-do the CS.Money OpenID login; refresh the Steam token first if needed."""
     logger.info("Session expired — performing OpenID re-login…")
     if steam.is_access_token_expired:
         await steam.refresh_access_token()
+        _save_steam_session(steam)
     cookies = await _do_openid_login(steam)
     client.update_cookies(cookies)
     _save_cookies(cookies)
@@ -373,7 +440,7 @@ async def run_active_offers_checker(
 async def run(stop_event: asyncio.Event) -> None:
     config.validate_config()
 
-    # 1. Steam login
+    # 1. Steam login (fast token restore when possible)
     steam = SteamClient(
         config.STEAM_ID,
         config.STEAM_USERNAME,
@@ -382,9 +449,7 @@ async def run(stop_event: asyncio.Event) -> None:
         identity_secret=config.STEAM_IDENTITY_SECRET,
         proxy=config.STEAM_PROXY or None,
     )
-    logger.info("Logging in to Steam as %s…", config.STEAM_USERNAME)
-    await steam.login()
-    logger.info("Steam login successful (steamId=%s)", steam.steam_id)
+    await _steam_login(steam)
 
     # 2. CS.Money session (saved or fresh OpenID)
     cookies = _load_saved_cookies()
