@@ -46,7 +46,7 @@ from aiosteampy.constants import STEAM_URL
 from aiosteampy.models import ConfirmationType
 
 from . import config
-from .csmoney_client import CsMoneyClient, SessionExpiredError
+from .csmoney_client import CsMoneyClient, RateLimitedError, SessionExpiredError
 from .openid_auth import openid_login
 from .session_crypto import encrypt_message
 from .steam_trade import send_steam_trade_offer
@@ -56,6 +56,10 @@ logger = logging.getLogger(__name__)
 OFFER_BOUGHT = "OFFER_BOUGHT"
 CHECK_ACTIVE_OFFERS_INTERVAL = 30   # seconds; extension uses 6 min alarms but we poll faster
 CONFIRMATION_INTERVAL = 15          # seconds between confirmation polls
+
+# Offer IDs for which we have already successfully created a Steam trade offer.
+# Cleared when the offer disappears from active-offers (CS.Money confirmed receipt).
+_completed_offers: set[int] = set()
 
 _COOKIE_FILE = Path("csmoney_cookies.json")
 _STEAM_SESSION_FILE = Path("steam_session.json")
@@ -147,7 +151,7 @@ def _steam_login_secure(steam: SteamClient) -> str:
 
 
 async def _do_openid_login(steam: SteamClient) -> dict:
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     return await loop.run_in_executor(
         None,
         functools.partial(openid_login, _steam_login_secure(steam), steam.session_id),
@@ -189,7 +193,13 @@ async def create_trade_for_offer(
       4. Immediately confirm the trade offer in Steam
     """
     offer_id = offer.get("id")
-    logger.info("Creating trade offer for CS.Money offer: %s", offer)
+    item_names = [
+        o.get("asset", {}).get("names", {}).get("short", o.get("asset", {}).get("name", "?"))
+        for o in offer.get("sellOrders", [])
+    ]
+    logger.info("Creating trade for offerId=%s items=%s", offer_id, item_names)
+
+    steam_offer_sent = False
     try:
         # Step 1 — notify CS.Money (response body is empty, data is in the offer dict)
         await client.initiate_trade_offer(offer_id)
@@ -228,7 +238,7 @@ async def create_trade_for_offer(
             )
 
         # Step 2 — send the Steam trade offer
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         trade_offer_id = await loop.run_in_executor(
             None,
             functools.partial(
@@ -243,6 +253,7 @@ async def create_trade_for_offer(
                 proxy=config.STEAM_PROXY or "",
             ),
         )
+        steam_offer_sent = True
 
         # Step 3 — report the trade offer ID + encrypted session to CS.Money
         key_info = await client.get_security_key()
@@ -261,20 +272,29 @@ async def create_trade_for_offer(
         logger.info(
             "Trade offer %s confirmed. offerId=%s complete.", trade_offer_id, offer_id
         )
+        _completed_offers.add(offer_id)
 
-    except SessionExpiredError:
+    except (SessionExpiredError, RateLimitedError):
         raise
     except Exception as exc:
         logger.error(
             "Failed to create trade for offerId=%s: %s", offer_id, exc, exc_info=True
         )
-        try:
-            await client.delete_trade_offer_draft(offer_id)
-            logger.info("Deleted trade offer draft for offerId=%s", offer_id)
-        except Exception as del_exc:
+        if steam_offer_sent:
+            # Steam offer exists — don't delete the CS.Money draft; the confirmation
+            # poller will confirm it and CS.Money will eventually resync.
             logger.warning(
-                "Could not delete draft for offerId=%s: %s", offer_id, del_exc
+                "Steam offer was already sent for offerId=%s — skipping draft deletion.",
+                offer_id,
             )
+        else:
+            try:
+                await client.delete_trade_offer_draft(offer_id)
+                logger.info("Deleted trade offer draft for offerId=%s", offer_id)
+            except Exception as del_exc:
+                logger.warning(
+                    "Could not delete draft for offerId=%s: %s", offer_id, del_exc
+                )
 
 
 # ── historyOutdate re-sync ────────────────────────────────────────────────────
@@ -322,20 +342,41 @@ async def process_active_offers(client: CsMoneyClient, steam: SteamClient) -> No
             logger.info("historyOutdate=true — sending session re-sync.")
             await send_steam_session(client, steam)
 
+        active_ids = {offer.get("id") for offer in offers}
+        # Clean up _completed_offers for offers no longer returned by CS.Money
+        stale = _completed_offers - active_ids
+        if stale:
+            logger.debug("Removing stale completed offer IDs: %s", stale)
+            _completed_offers.difference_update(stale)
+
         for offer in offers:
             offer_id = offer.get("id")
             status = offer.get("status")
             steam_offer_id = offer.get("steamOfferId")
             offer_type = offer.get("type", "")
 
-            logger.info(
-                "Offer id=%s type=%s status=%s steamOfferId=%s",
-                offer_id, offer_type, status, steam_offer_id,
-            )
-
             # Create trade for SELL offers that haven't been sent to Steam yet
             if offer_type == "SELL" and status == "CREATING" and not steam_offer_id:
-                await create_trade_for_offer(client, steam, offer)
+                if offer_id in _completed_offers:
+                    logger.debug(
+                        "Offer id=%s already processed — skipping until CS.Money updates.",
+                        offer_id,
+                    )
+                    continue
+                logger.info(
+                    "Offer id=%s type=%s status=%s steamOfferId=%s — initiating trade.",
+                    offer_id, offer_type, status, steam_offer_id,
+                )
+                try:
+                    await create_trade_for_offer(client, steam, offer)
+                except RateLimitedError as exc:
+                    logger.warning("Rate-limited by CS.Money (%s) — will retry next cycle.", exc)
+                    break  # No point trying other offers right now
+            else:
+                logger.debug(
+                    "Offer id=%s type=%s status=%s steamOfferId=%s",
+                    offer_id, offer_type, status, steam_offer_id,
+                )
 
     except SessionExpiredError:
         raise
@@ -485,38 +526,35 @@ async def run(stop_event: asyncio.Event) -> None:
     ) as http:
         client = CsMoneyClient(http, cookies)
 
-        if cookies:
-            try:
-                store = await client.get_user_store()
-                logger.info(
-                    "Resumed session from saved cookies. Store status: %s",
-                    store.get("status", "?"),
-                )
-            except SessionExpiredError:
-                logger.info("Saved cookies expired — performing OpenID login…")
+        try:
+            if cookies:
+                try:
+                    store = await client.get_user_store()
+                    logger.info(
+                        "Resumed CS.Money session from saved cookies (store status: %s).",
+                        store.get("status", "?"),
+                    )
+                except SessionExpiredError:
+                    logger.info("Saved cookies expired — performing OpenID login…")
+                    cookies = await _do_openid_login(steam)
+                    client.update_cookies(cookies)
+                    _save_cookies(cookies)
+                    store = await client.get_user_store()
+                    logger.info(
+                        "Connected to CS.Money (store status: %s).", store.get("status", "?")
+                    )
+            else:
+                logger.info("No saved cookies — performing OpenID login…")
                 cookies = await _do_openid_login(steam)
                 client.update_cookies(cookies)
                 _save_cookies(cookies)
                 store = await client.get_user_store()
                 logger.info(
-                    "Connected to CS.Money. Store status: %s", store.get("status", "?")
+                    "Connected to CS.Money (store status: %s).", store.get("status", "?")
                 )
-            except Exception as exc:
-                logger.error("Startup check failed: %s", exc)
-                return
-        else:
-            logger.info("No saved cookies — performing OpenID login…")
-            try:
-                cookies = await _do_openid_login(steam)
-                client.update_cookies(cookies)
-                _save_cookies(cookies)
-                store = await client.get_user_store()
-                logger.info(
-                    "Connected to CS.Money. Store status: %s", store.get("status", "?")
-                )
-            except Exception as exc:
-                logger.error("Startup failed: %s", exc)
-                return
+        except Exception as exc:
+            logger.error("Startup failed: %s", exc)
+            return
 
         # 3. Initial active-offers check
         await process_active_offers(client, steam)

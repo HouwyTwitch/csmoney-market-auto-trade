@@ -12,6 +12,10 @@ class SessionExpiredError(Exception):
     """Raised when CS.Money returns 401/403, indicating the session has expired."""
 
 
+class RateLimitedError(Exception):
+    """Raised when CS.Money returns error code 9999 (rate limited)."""
+
+
 def _build_headers(extra: Optional[dict] = None) -> dict:
     headers = {
         "accept": "application/json",
@@ -107,15 +111,22 @@ class CsMoneyClient:
         """
         POST /3.0/market/offers/tradeoffer
         Notify CS.Money that we are starting to create the trade offer.
-        The response body is empty (HTTP 201); all trade data comes from
-        the active-offers payload the caller already has.
+        Success → HTTP 201 empty body.
+        Rate-limited → body contains {"errors": [{"code": 9999}]}.
         """
         url = f"{self._base}/3.0/market/offers/tradeoffer"
-        await self._post(
+        resp = await self._post(
             url,
             _ext_headers({"content-type": "application/json"}),
             json={"activeOfferId": active_offer_id},
         )
+        if resp.content:
+            body = resp.json()
+            errors = body.get("errors", [])
+            if any(e.get("code") == 9999 for e in errors):
+                raise RateLimitedError(
+                    f"CS.Money rate-limited (9999) for activeOfferId={active_offer_id}"
+                )
 
     async def delete_trade_offer_draft(self, active_offer_id: int) -> None:
         """DELETE /3.0/market/offers/tradeoffer — cancel the draft on error."""
