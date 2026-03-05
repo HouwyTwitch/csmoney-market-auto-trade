@@ -147,7 +147,7 @@ class CsMoneyClient:
     ) -> None:
         """PATCH /4.0/market/offers/tradeoffer — report back the Steam trade-offer ID."""
         url = f"{self._base}/4.0/market/offers/tradeoffer"
-        await self._patch(
+        resp = await self._patch(
             url,
             _ext_headers({"content-type": "application/json"}),
             json={
@@ -158,6 +158,16 @@ class CsMoneyClient:
                 "correlationId": correlation_id,
             },
         )
+        body = resp.json() if resp.content else {}
+        logger.debug(
+            "report_trade_offer response (offerId=%s tradeOfferId=%s): %s",
+            offer_id, trade_offer_id, body,
+        )
+        errors = body.get("errors", [])
+        if errors:
+            raise RuntimeError(
+                f"CS.Money rejected report_trade_offer for offerId={offer_id}: {errors}"
+            )
         logger.info(
             "Trade offer reported to CS.Money (offerId=%s tradeOfferId=%s correlationId=%s)",
             offer_id,
@@ -181,7 +191,7 @@ class CsMoneyClient:
     ) -> None:
         """POST /4.0/market/offers/session — used for historyOutdate re-sync."""
         url = f"{self._base}/4.0/market/offers/session"
-        await self._post(
+        resp = await self._post(
             url,
             _ext_headers({"content-type": "application/json"}),
             json={
@@ -190,6 +200,11 @@ class CsMoneyClient:
                 "correlationId": correlation_id,
             },
         )
+        body = resp.json() if resp.content else {}
+        logger.debug("send_session response (correlationId=%s): %s", correlation_id, body)
+        errors = body.get("errors", [])
+        if errors:
+            raise RuntimeError(f"CS.Money rejected send_session: {errors}")
         logger.info("Session sent successfully (correlationId=%s)", correlation_id)
 
     async def get_user_store(self) -> dict:
