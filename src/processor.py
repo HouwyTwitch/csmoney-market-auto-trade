@@ -57,6 +57,10 @@ OFFER_BOUGHT = "OFFER_BOUGHT"
 CHECK_ACTIVE_OFFERS_INTERVAL = 30   # seconds; extension uses 6 min alarms but we poll faster
 CONFIRMATION_INTERVAL = 15          # seconds between confirmation polls
 
+# Offer IDs for which we have already successfully created a Steam trade offer.
+# Cleared when the offer disappears from active-offers (CS.Money confirmed receipt).
+_completed_offers: set[int] = set()
+
 _COOKIE_FILE = Path("csmoney_cookies.json")
 _STEAM_SESSION_FILE = Path("steam_session.json")
 
@@ -261,6 +265,7 @@ async def create_trade_for_offer(
         logger.info(
             "Trade offer %s confirmed. offerId=%s complete.", trade_offer_id, offer_id
         )
+        _completed_offers.add(offer_id)
 
     except SessionExpiredError:
         raise
@@ -322,6 +327,13 @@ async def process_active_offers(client: CsMoneyClient, steam: SteamClient) -> No
             logger.info("historyOutdate=true — sending session re-sync.")
             await send_steam_session(client, steam)
 
+        active_ids = {offer.get("id") for offer in offers}
+        # Clean up _completed_offers for offers no longer returned by CS.Money
+        stale = _completed_offers - active_ids
+        if stale:
+            logger.debug("Removing stale completed offer IDs: %s", stale)
+            _completed_offers.difference_update(stale)
+
         for offer in offers:
             offer_id = offer.get("id")
             status = offer.get("status")
@@ -335,6 +347,12 @@ async def process_active_offers(client: CsMoneyClient, steam: SteamClient) -> No
 
             # Create trade for SELL offers that haven't been sent to Steam yet
             if offer_type == "SELL" and status == "CREATING" and not steam_offer_id:
+                if offer_id in _completed_offers:
+                    logger.debug(
+                        "Offer id=%s already processed — skipping until CS.Money updates.",
+                        offer_id,
+                    )
+                    continue
                 await create_trade_for_offer(client, steam, offer)
 
     except SessionExpiredError:
