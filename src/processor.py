@@ -46,7 +46,7 @@ from aiosteampy.constants import STEAM_URL
 from aiosteampy.models import ConfirmationType
 
 from . import config
-from .csmoney_client import CsMoneyClient, SessionExpiredError
+from .csmoney_client import CsMoneyClient, RateLimitedError, SessionExpiredError
 from .openid_auth import openid_login
 from .session_crypto import encrypt_message
 from .steam_trade import send_steam_trade_offer
@@ -267,7 +267,7 @@ async def create_trade_for_offer(
         )
         _completed_offers.add(offer_id)
 
-    except SessionExpiredError:
+    except (SessionExpiredError, RateLimitedError):
         raise
     except Exception as exc:
         logger.error(
@@ -353,7 +353,11 @@ async def process_active_offers(client: CsMoneyClient, steam: SteamClient) -> No
                         offer_id,
                     )
                     continue
-                await create_trade_for_offer(client, steam, offer)
+                try:
+                    await create_trade_for_offer(client, steam, offer)
+                except RateLimitedError as exc:
+                    logger.warning("Rate-limited by CS.Money (%s) — will retry next cycle.", exc)
+                    break  # No point trying other offers right now
 
     except SessionExpiredError:
         raise
