@@ -1,21 +1,29 @@
 """
 Main processing loop for CS.Money auto-sale tool.
 
-Flow (mirrors the CS.Money Chrome extension service worker):
-  1. Poll /1.0/market/notifications every POLL_INTERVAL seconds.
-  2. When an OFFER_BOUGHT notification appears:
-       a. Mark it viewed.
-       b. Fetch active offers.
-       c. If historyOutdate=true → send encrypted Steam session.
-  3. Every CHECK_ACTIVE_OFFERS_INTERVAL seconds also check active offers
-     directly (catches cases where notification was missed).
-  4. If historyOutdate is signalled, send the session unconditionally.
+The real flow (reverse-engineered from the CS.Money Chrome extension):
+
+  Notification path (every ~10 s):
+    Poll /1.0/market/notifications.  No trade creation happens here — the
+    extension only shows desktop notifications from this alarm.
+
+  Active-offers path (every CHECK_ACTIVE_OFFERS_INTERVAL seconds):
+    1. GET  /3.0/market/active-offers
+    2a. If historyOutdate=true → POST /4.0/market/offers/session (re-sync)
+    2b. For each offer with status CREATING (no steamOfferId yet):
+          POST /3.0/market/offers/tradeoffer   ← ask CS.Money for trade data
+          POST steamcommunity.com/tradeoffer/new/send  ← send trade directly
+          POST /1.0/market/secure/key          ← get encryption key
+          PATCH /4.0/market/offers/tradeoffer  ← report tradeOfferId + session
+          confirm_trade_offer                  ← approve via mobile auth
+    2c. For existing offers whose Steam status diverges → re-send session
+
+  Confirmation path (every CONFIRMATION_INTERVAL seconds):
+    Catch any confirmations the active-offers path may have missed.
 
 Cookie persistence:
-  - Cookies are saved to csmoney_cookies.json after each login.
-  - On startup, saved cookies are tried first; full OpenID re-login is only
-    performed when the session is confirmed dead (401/403 or missing cookies).
-  - SessionExpiredError from CsMoneyClient triggers automatic re-login.
+  Cookies written to csmoney_cookies.json after each login.
+  Saved cookies tried first on startup; re-login only if expired.
 """
 
 import asyncio
@@ -33,15 +41,17 @@ from . import config
 from .csmoney_client import CsMoneyClient, SessionExpiredError
 from .openid_auth import openid_login
 from .session_crypto import encrypt_message
+from .steam_trade import send_steam_trade_offer
 
 logger = logging.getLogger(__name__)
 
 OFFER_BOUGHT = "OFFER_BOUGHT"
-CHECK_ACTIVE_OFFERS_INTERVAL = 360  # 6 minutes, same as extension alarm
-CONFIRMATION_INTERVAL = 15  # seconds between confirmation polls
+CHECK_ACTIVE_OFFERS_INTERVAL = 30   # seconds; extension uses 6 min alarms but we poll faster
+CONFIRMATION_INTERVAL = 15          # seconds between confirmation polls
 
 _COOKIE_FILE = Path("csmoney_cookies.json")
 
+# ── cookie persistence ────────────────────────────────────────────────────────
 
 def _load_saved_cookies() -> dict:
     if _COOKIE_FILE.exists():
@@ -63,29 +73,24 @@ def _save_cookies(cookies: dict) -> None:
         logger.warning("Could not save cookies to %s: %s", _COOKIE_FILE, exc)
 
 
+# ── Steam helpers ─────────────────────────────────────────────────────────────
+
 def _steam_login_secure(steam: SteamClient) -> str:
-    """Return the full steamLoginSecure cookie value: {steamId}%7C%7C{accessToken}."""
+    """Return the steamLoginSecure cookie value: {steamId}%7C%7C{accessToken}."""
     return f"{steam.steam_id}%7C%7C{steam.access_token}"
 
 
 async def _do_openid_login(steam: SteamClient) -> dict:
-    """Run OpenID login in executor and return the full cookies dict."""
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(
         None,
-        functools.partial(
-            openid_login,
-            _steam_login_secure(steam),
-            steam.session_id,
-        ),
+        functools.partial(openid_login, _steam_login_secure(steam), steam.session_id),
     )
 
 
 async def relogin(client: CsMoneyClient, steam: SteamClient) -> None:
-    """Perform a full OpenID re-login and update the client's cookies."""
     logger.info("Session expired — performing OpenID re-login…")
     if steam.is_access_token_expired:
-        logger.info("Steam access token expired — refreshing…")
         await steam.refresh_access_token()
     cookies = await _do_openid_login(steam)
     client.update_cookies(cookies)
@@ -93,25 +98,107 @@ async def relogin(client: CsMoneyClient, steam: SteamClient) -> None:
     logger.info("Re-login successful.")
 
 
-async def send_steam_session(client: CsMoneyClient, steam: SteamClient) -> None:
-    """Encrypt Steam cookies and submit them to CS.Money."""
-    logger.info("Sending Steam session to CS.Money...")
+# ── trade creation ────────────────────────────────────────────────────────────
+
+async def _encrypt_session(steam: SteamClient, public_key: str) -> tuple[str, str]:
+    """Return (encrypted_session_id, encrypted_session_data)."""
+    if steam.is_access_token_expired:
+        logger.info("Steam access token expired — refreshing…")
+        await steam.refresh_access_token()
+    encrypted_data = encrypt_message(public_key, _steam_login_secure(steam))
+    encrypted_id = encrypt_message(public_key, steam.session_id)
+    return encrypted_id, encrypted_data
+
+
+async def create_trade_for_offer(
+    client: CsMoneyClient, steam: SteamClient, offer_id: int
+) -> None:
+    """
+    Full trade-creation flow for a single CS.Money offer:
+      1. Ask CS.Money for trade data (POST /3.0/market/offers/tradeoffer)
+      2. Send Steam trade offer directly
+      3. Report trade offer ID + encrypted session back to CS.Money (PATCH)
+      4. Immediately confirm the trade offer in Steam
+    """
+    logger.info("Creating trade offer for CS.Money offerId=%s", offer_id)
+    trade_data = None
     try:
-        if steam.is_access_token_expired:
-            logger.info("Steam access token expired — refreshing…")
-            await steam.refresh_access_token()
+        # Step 1 — get trade data from CS.Money
+        trade_data = await client.initiate_trade_offer(offer_id)
+        logger.info("CS.Money trade data received for offerId=%s: %s", offer_id, trade_data)
 
+        partner_steam_id = str(trade_data["steamId64"])
+        partner_token = trade_data["token"]
+        assets = trade_data["assets"]
+        message = trade_data.get("message", "")
+
+        # Step 2 — send the Steam trade offer
+        loop = asyncio.get_event_loop()
+        trade_offer_id = await loop.run_in_executor(
+            None,
+            functools.partial(
+                send_steam_trade_offer,
+                steam_login_secure=_steam_login_secure(steam),
+                session_id=steam.session_id,
+                partner_steam_id=partner_steam_id,
+                partner_token=partner_token,
+                assets=assets,
+                offer_id=offer_id,
+                message=message,
+                proxy=config.STEAM_PROXY or "",
+            ),
+        )
+
+        # Step 3 — report the trade offer ID + encrypted session to CS.Money
         key_info = await client.get_security_key()
-        public_key = key_info["publicKey"]
-        correlation_id = key_info["correlationId"]
+        enc_id, enc_data = await _encrypt_session(steam, key_info["publicKey"])
+        await client.report_trade_offer(
+            offer_id=offer_id,
+            trade_offer_id=trade_offer_id,
+            session_id=enc_id,
+            session_data=enc_data,
+            correlation_id=key_info["correlationId"],
+        )
 
-        encrypted_session_data = encrypt_message(public_key, _steam_login_secure(steam))
-        encrypted_session_id = encrypt_message(public_key, steam.session_id)
+        # Step 4 — confirm immediately (don't wait for the 15-s poller)
+        logger.info("Confirming trade offer %s in Steam…", trade_offer_id)
+        await steam.confirm_trade_offer(int(trade_offer_id))
+        logger.info(
+            "Trade offer %s confirmed. offerId=%s complete.", trade_offer_id, offer_id
+        )
 
+    except SessionExpiredError:
+        raise
+    except Exception as exc:
+        logger.error(
+            "Failed to create trade for offerId=%s: %s", offer_id, exc, exc_info=True
+        )
+        # Try to clean up the draft so CS.Money doesn't leave it hanging
+        if trade_data is not None:
+            try:
+                await client.delete_trade_offer_draft(offer_id)
+                logger.info("Deleted trade offer draft for offerId=%s", offer_id)
+            except Exception as del_exc:
+                logger.warning(
+                    "Could not delete draft for offerId=%s: %s", offer_id, del_exc
+                )
+
+
+# ── historyOutdate re-sync ────────────────────────────────────────────────────
+
+async def send_steam_session(client: CsMoneyClient, steam: SteamClient) -> None:
+    """
+    For historyOutdate=true: send encrypted session credentials to CS.Money
+    via POST /4.0/market/offers/session so CS.Money can re-sync trade state.
+    """
+    logger.info("Sending Steam session to CS.Money (historyOutdate re-sync)…")
+    try:
+        key_info = await client.get_security_key()
+        enc_id, enc_data = await _encrypt_session(steam, key_info["publicKey"])
         await client.send_session(
-            session_id=encrypted_session_id,
-            session_data=encrypted_session_data,
-            correlation_id=correlation_id,
+            session_id=enc_id,
+            session_data=enc_data,
+            correlation_id=key_info["correlationId"],
         )
         logger.info("Steam session submitted successfully.")
     except SessionExpiredError:
@@ -120,8 +207,14 @@ async def send_steam_session(client: CsMoneyClient, steam: SteamClient) -> None:
         logger.error("Failed to send Steam session: %s", exc)
 
 
+# ── active-offers checker ─────────────────────────────────────────────────────
+
 async def process_active_offers(client: CsMoneyClient, steam: SteamClient) -> None:
-    """Check active offers and send session if CS.Money requests it."""
+    """
+    Check active offers and handle:
+      • historyOutdate=true  → send session credentials
+      • offer.status CREATING (no steamOfferId yet)  → create trade offer
+    """
     try:
         data = await client.get_active_offers()
         offers = data.get("activeOffers", [])
@@ -133,22 +226,34 @@ async def process_active_offers(client: CsMoneyClient, steam: SteamClient) -> No
         logger.debug("Active offers full response: %s", data)
 
         if history_outdate:
-            logger.info(
-                "historyOutdate=true — CS.Money needs Steam session to process trades."
-            )
+            logger.info("historyOutdate=true — sending session re-sync.")
             await send_steam_session(client, steam)
-        elif offers:
-            creating = [o for o in offers if o.get("status") == "CREATING"]
-            if creating:
-                logger.info(
-                    "%d offer(s) in CREATING state — sending Steam session.", len(creating)
-                )
-                await send_steam_session(client, steam)
+
+        for offer in offers:
+            offer_id = offer.get("id")
+            status = offer.get("status")
+            steam_offer_id = offer.get("steamOfferId")
+            offer_type = offer.get("type", "")
+
+            logger.debug(
+                "Offer id=%s type=%s status=%s steamOfferId=%s",
+                offer_id,
+                offer_type,
+                status,
+                steam_offer_id,
+            )
+
+            # Create trade for SELL offers that haven't been sent to Steam yet
+            if offer_type == "SELL" and status == "CREATING" and not steam_offer_id:
+                await create_trade_for_offer(client, steam, offer_id)
+
     except SessionExpiredError:
         raise
     except Exception as exc:
         logger.error("Error checking active offers: %s", exc)
 
+
+# ── notification poller ───────────────────────────────────────────────────────
 
 async def handle_notification(
     client: CsMoneyClient, steam: SteamClient, notification: dict
@@ -163,6 +268,7 @@ async def handle_notification(
             await client.mark_notifications_viewed([nid])
         except Exception as exc:
             logger.warning("Could not mark notification %s as viewed: %s", nid, exc)
+        # Immediately check active offers so we don't wait for the periodic interval
         await process_active_offers(client, steam)
     else:
         logger.debug("Ignoring notification type=%s id=%s", ntype, nid)
@@ -170,8 +276,7 @@ async def handle_notification(
 
 async def run_notification_poller(
     client: CsMoneyClient, steam: SteamClient, stop_event: asyncio.Event
-):
-    """Poll the notifications endpoint continuously."""
+) -> None:
     updated_from = int(time.time() * 1000)
     logger.info("Starting notification poller (updatedFrom=%d)", updated_from)
 
@@ -206,11 +311,13 @@ async def run_notification_poller(
             pass
 
 
-async def run_confirmation_poller(steam: SteamClient, stop_event: asyncio.Event):
-    """Periodically fetch and auto-confirm pending Steam trade confirmations."""
-    logger.info(
-        "Starting confirmation poller (interval=%ds)", CONFIRMATION_INTERVAL
-    )
+# ── confirmation poller ───────────────────────────────────────────────────────
+
+async def run_confirmation_poller(
+    steam: SteamClient, stop_event: asyncio.Event
+) -> None:
+    """Catch any trade confirmations that create_trade_for_offer may have missed."""
+    logger.info("Starting confirmation poller (interval=%ds)", CONFIRMATION_INTERVAL)
     while not stop_event.is_set():
         try:
             confs = await steam.get_confirmations()
@@ -235,10 +342,11 @@ async def run_confirmation_poller(steam: SteamClient, stop_event: asyncio.Event)
             pass
 
 
+# ── active-offers periodic checker ───────────────────────────────────────────
+
 async def run_active_offers_checker(
     client: CsMoneyClient, steam: SteamClient, stop_event: asyncio.Event
-):
-    """Periodically check active offers independent of notifications."""
+) -> None:
     logger.info(
         "Starting active-offers checker (interval=%ds)", CHECK_ACTIVE_OFFERS_INTERVAL
     )
@@ -260,10 +368,12 @@ async def run_active_offers_checker(
             pass
 
 
-async def run(stop_event: asyncio.Event):
+# ── entry point ───────────────────────────────────────────────────────────────
+
+async def run(stop_event: asyncio.Event) -> None:
     config.validate_config()
 
-    # 1. Login to Steam via aiosteampy
+    # 1. Steam login
     steam = SteamClient(
         config.STEAM_ID,
         config.STEAM_USERNAME,
@@ -276,10 +386,10 @@ async def run(stop_event: asyncio.Event):
     await steam.login()
     logger.info("Steam login successful (steamId=%s)", steam.steam_id)
 
-    # 2. Try saved cookies; fall back to full OpenID login
+    # 2. CS.Money session (saved or fresh OpenID)
     cookies = _load_saved_cookies()
-
     proxy = config.CSMONEY_PROXY or None
+
     async with primp.AsyncClient(
         impersonate="chrome_144",
         impersonate_os="windows",
@@ -287,7 +397,6 @@ async def run(stop_event: asyncio.Event):
     ) as http:
         client = CsMoneyClient(http, cookies)
 
-        # Verify the session (saved or fresh); re-login if needed
         if cookies:
             try:
                 store = await client.get_user_store()
@@ -296,7 +405,7 @@ async def run(stop_event: asyncio.Event):
                     store.get("status", "?"),
                 )
             except SessionExpiredError:
-                logger.info("Saved cookies are expired — performing OpenID login…")
+                logger.info("Saved cookies expired — performing OpenID login…")
                 cookies = await _do_openid_login(steam)
                 client.update_cookies(cookies)
                 _save_cookies(cookies)
@@ -308,7 +417,6 @@ async def run(stop_event: asyncio.Event):
                 logger.error("Startup check failed: %s", exc)
                 return
         else:
-            # No saved cookies — do a fresh OpenID login
             logger.info("No saved cookies — performing OpenID login…")
             try:
                 cookies = await _do_openid_login(steam)
@@ -322,7 +430,7 @@ async def run(stop_event: asyncio.Event):
                 logger.error("Startup failed: %s", exc)
                 return
 
-        # Run an initial active-offers check immediately
+        # 3. Initial active-offers check
         await process_active_offers(client, steam)
 
         await asyncio.gather(
