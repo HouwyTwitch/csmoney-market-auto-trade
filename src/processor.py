@@ -178,26 +178,54 @@ async def _encrypt_session(steam: SteamClient, public_key: str) -> tuple[str, st
 
 
 async def create_trade_for_offer(
-    client: CsMoneyClient, steam: SteamClient, offer_id: int
+    client: CsMoneyClient, steam: SteamClient, offer: dict
 ) -> None:
     """
     Full trade-creation flow for a single CS.Money offer:
-      1. Ask CS.Money for trade data (POST /3.0/market/offers/tradeoffer)
-      2. Send Steam trade offer directly
+      1. Notify CS.Money we are creating the trade (POST /3.0/market/offers/tradeoffer — empty 201)
+      2. Send Steam trade offer directly using data from the offer dict
       3. Report trade offer ID + encrypted session back to CS.Money (PATCH)
       4. Immediately confirm the trade offer in Steam
     """
-    logger.info("Creating trade offer for CS.Money offerId=%s", offer_id)
-    trade_data = None
+    offer_id = offer.get("id")
+    logger.info("Creating trade offer for CS.Money offer: %s", offer)
     try:
-        # Step 1 — get trade data from CS.Money
-        trade_data = await client.initiate_trade_offer(offer_id)
-        logger.info("CS.Money trade data received for offerId=%s: %s", offer_id, trade_data)
+        # Step 1 — notify CS.Money (response body is empty, data is in the offer dict)
+        await client.initiate_trade_offer(offer_id)
 
-        partner_steam_id = str(trade_data["steamId64"])
-        partner_token = trade_data["token"]
-        assets = trade_data["assets"]
-        message = trade_data.get("message", "")
+        # Extract partner / item data from the active-offers offer dict
+        # Log the full offer so field names are visible if extraction fails
+        partner_steam_id = str(
+            offer.get("steamId64")
+            or offer.get("partnerSteamId")
+            or offer.get("partner", {}).get("steamId64", "")
+            or offer.get("tradePartner", {}).get("steamId64", "")
+        )
+        partner_token = (
+            offer.get("token")
+            or offer.get("tradeToken")
+            or offer.get("partner", {}).get("token", "")
+            or offer.get("tradePartner", {}).get("token", "")
+        )
+        # Assets may be a top-level list or nested inside "item"
+        assets = offer.get("assets") or offer.get("items") or []
+        if not assets and offer.get("item"):
+            item = offer["item"]
+            assets = [{
+                "appid": item.get("appId", 730),
+                "contextid": str(item.get("contextId", 2)),
+                "assetid": str(item.get("assetId") or item.get("id", "")),
+                "amount": 1,
+            }]
+        message = offer.get("message", "")
+
+        if not partner_steam_id or not partner_token or not assets:
+            raise ValueError(
+                f"Could not extract trade params from offer. "
+                f"partner_steam_id={partner_steam_id!r} "
+                f"partner_token={partner_token!r} "
+                f"assets={assets!r}"
+            )
 
         # Step 2 — send the Steam trade offer
         loop = asyncio.get_event_loop()
@@ -240,15 +268,13 @@ async def create_trade_for_offer(
         logger.error(
             "Failed to create trade for offerId=%s: %s", offer_id, exc, exc_info=True
         )
-        # Try to clean up the draft so CS.Money doesn't leave it hanging
-        if trade_data is not None:
-            try:
-                await client.delete_trade_offer_draft(offer_id)
-                logger.info("Deleted trade offer draft for offerId=%s", offer_id)
-            except Exception as del_exc:
-                logger.warning(
-                    "Could not delete draft for offerId=%s: %s", offer_id, del_exc
-                )
+        try:
+            await client.delete_trade_offer_draft(offer_id)
+            logger.info("Deleted trade offer draft for offerId=%s", offer_id)
+        except Exception as del_exc:
+            logger.warning(
+                "Could not delete draft for offerId=%s: %s", offer_id, del_exc
+            )
 
 
 # ── historyOutdate re-sync ────────────────────────────────────────────────────
@@ -302,17 +328,14 @@ async def process_active_offers(client: CsMoneyClient, steam: SteamClient) -> No
             steam_offer_id = offer.get("steamOfferId")
             offer_type = offer.get("type", "")
 
-            logger.debug(
+            logger.info(
                 "Offer id=%s type=%s status=%s steamOfferId=%s",
-                offer_id,
-                offer_type,
-                status,
-                steam_offer_id,
+                offer_id, offer_type, status, steam_offer_id,
             )
 
             # Create trade for SELL offers that haven't been sent to Steam yet
             if offer_type == "SELL" and status == "CREATING" and not steam_offer_id:
-                await create_trade_for_offer(client, steam, offer_id)
+                await create_trade_for_offer(client, steam, offer)
 
     except SessionExpiredError:
         raise

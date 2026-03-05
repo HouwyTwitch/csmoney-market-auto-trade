@@ -103,19 +103,19 @@ class CsMoneyClient:
 
     # ── trade-offer draft lifecycle ───────────────────────────────────────────
 
-    async def initiate_trade_offer(self, active_offer_id: int) -> dict:
+    async def initiate_trade_offer(self, active_offer_id: int) -> None:
         """
         POST /3.0/market/offers/tradeoffer
-        Ask CS.Money to prepare a trade-offer draft for `active_offer_id`.
-        Returns a dict with at least: steamId64, token, assets, message.
+        Notify CS.Money that we are starting to create the trade offer.
+        The response body is empty (HTTP 201); all trade data comes from
+        the active-offers payload the caller already has.
         """
         url = f"{self._base}/3.0/market/offers/tradeoffer"
-        resp = await self._post(
+        await self._post(
             url,
             _ext_headers({"content-type": "application/json"}),
             json={"activeOfferId": active_offer_id},
         )
-        return resp.json()
 
     async def delete_trade_offer_draft(self, active_offer_id: int) -> None:
         """DELETE /3.0/market/offers/tradeoffer — cancel the draft on error."""
