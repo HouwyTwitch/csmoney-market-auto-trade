@@ -26,6 +26,13 @@ def _build_headers(extra: Optional[dict] = None) -> dict:
     return headers
 
 
+def _ext_headers(extra: Optional[dict] = None) -> dict:
+    """Headers for requests that come from the extension origin."""
+    return _build_headers(
+        {"origin": f"chrome-extension://{config.EXTENSION_ID}", **(extra or {})}
+    )
+
+
 class CsMoneyClient:
     def __init__(self, http: primp.AsyncClient, cookies: dict):
         self._http = http
@@ -49,6 +56,22 @@ class CsMoneyClient:
         resp.raise_for_status()
         return resp
 
+    async def _patch(self, url: str, headers: dict, **kwargs) -> primp.Response:
+        resp = await self._http.patch(url, headers=headers, cookies=self._cookies, **kwargs)
+        if resp.status_code in (401, 403):
+            raise SessionExpiredError(f"Session expired — HTTP {resp.status_code} on {url}")
+        resp.raise_for_status()
+        return resp
+
+    async def _delete(self, url: str, headers: dict, **kwargs) -> primp.Response:
+        resp = await self._http.delete(url, headers=headers, cookies=self._cookies, **kwargs)
+        if resp.status_code in (401, 403):
+            raise SessionExpiredError(f"Session expired — HTTP {resp.status_code} on {url}")
+        resp.raise_for_status()
+        return resp
+
+    # ── notification endpoints ────────────────────────────────────────────────
+
     async def get_notifications(self, updated_from: int) -> dict:
         url = (
             f"{self._base}/1.0/market/notifications"
@@ -71,30 +94,73 @@ class CsMoneyClient:
             json={"notificationsIds": notification_ids},
         )
 
+    # ── active-offers endpoints ───────────────────────────────────────────────
+
     async def get_active_offers(self) -> dict:
         url = f"{self._base}/3.0/market/active-offers"
-        resp = await self._get(
+        resp = await self._get(url, _ext_headers({"content-type": "application/json"}))
+        return resp.json()
+
+    # ── trade-offer draft lifecycle ───────────────────────────────────────────
+
+    async def initiate_trade_offer(self, active_offer_id: int) -> dict:
+        """
+        POST /3.0/market/offers/tradeoffer
+        Ask CS.Money to prepare a trade-offer draft for `active_offer_id`.
+        Returns a dict with at least: steamId64, token, assets, message.
+        """
+        url = f"{self._base}/3.0/market/offers/tradeoffer"
+        resp = await self._post(
             url,
-            _build_headers(
-                {
-                    "content-type": "application/json",
-                    "origin": f"chrome-extension://{config.EXTENSION_ID}",
-                }
-            ),
+            _ext_headers({"content-type": "application/json"}),
+            json={"activeOfferId": active_offer_id},
         )
         return resp.json()
+
+    async def delete_trade_offer_draft(self, active_offer_id: int) -> None:
+        """DELETE /3.0/market/offers/tradeoffer — cancel the draft on error."""
+        url = f"{self._base}/3.0/market/offers/tradeoffer"
+        await self._delete(
+            url,
+            _ext_headers({"content-type": "application/json"}),
+            json={"activeOfferId": active_offer_id},
+        )
+
+    async def report_trade_offer(
+        self,
+        offer_id: int,
+        trade_offer_id: str,
+        session_id: str,
+        session_data: str,
+        correlation_id: str,
+    ) -> None:
+        """PATCH /4.0/market/offers/tradeoffer — report back the Steam trade-offer ID."""
+        url = f"{self._base}/4.0/market/offers/tradeoffer"
+        await self._patch(
+            url,
+            _ext_headers({"content-type": "application/json"}),
+            json={
+                "offerId": offer_id,
+                "tradeOfferId": trade_offer_id,
+                "sessionId": session_id,
+                "sessionData": session_data,
+                "correlationId": correlation_id,
+            },
+        )
+        logger.info(
+            "Trade offer reported to CS.Money (offerId=%s tradeOfferId=%s correlationId=%s)",
+            offer_id,
+            trade_offer_id,
+            correlation_id,
+        )
+
+    # ── session / security-key endpoints ─────────────────────────────────────
 
     async def get_security_key(self) -> dict:
         url = f"{self._base}/1.0/market/secure/key"
         resp = await self._post(
             url,
-            _build_headers(
-                {
-                    "content-type": "application/json",
-                    "content-length": "0",
-                    "origin": f"chrome-extension://{config.EXTENSION_ID}",
-                }
-            ),
+            _ext_headers({"content-type": "application/json", "content-length": "0"}),
             content=b"",
         )
         return resp.json()
@@ -102,15 +168,11 @@ class CsMoneyClient:
     async def send_session(
         self, session_id: str, session_data: str, correlation_id: str
     ) -> None:
+        """POST /4.0/market/offers/session — used for historyOutdate re-sync."""
         url = f"{self._base}/4.0/market/offers/session"
         await self._post(
             url,
-            _build_headers(
-                {
-                    "content-type": "application/json",
-                    "origin": f"chrome-extension://{config.EXTENSION_ID}",
-                }
-            ),
+            _ext_headers({"content-type": "application/json"}),
             json={
                 "sessionId": session_id,
                 "sessionData": session_data,
