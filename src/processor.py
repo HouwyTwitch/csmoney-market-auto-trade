@@ -43,7 +43,6 @@ from urllib.parse import parse_qs, urlparse
 import primp
 from aiosteampy import SteamClient
 from aiosteampy.constants import STEAM_URL
-from aiosteampy.models import ConfirmationType
 
 from . import config
 from .csmoney_client import CsMoneyClient, RateLimitedError, SessionExpiredError
@@ -57,9 +56,13 @@ OFFER_BOUGHT = "OFFER_BOUGHT"
 CHECK_ACTIVE_OFFERS_INTERVAL = 30   # seconds; extension uses 6 min alarms but we poll faster
 CONFIRMATION_INTERVAL = 15          # seconds between confirmation polls
 
-# Offer IDs for which we have already successfully created a Steam trade offer.
+# CS.Money offer IDs for which we have already successfully created a Steam trade offer.
 # Cleared when the offer disappears from active-offers (CS.Money confirmed receipt).
 _completed_offers: set[int] = set()
+
+# Steam trade offer IDs that have been sent but not yet confirmed in Steam.
+# The confirmation poller uses this to confirm only our own trades.
+_pending_steam_confirmations: set[int] = set()
 
 _COOKIE_FILE = Path("csmoney_cookies.json")
 _STEAM_SESSION_FILE = Path("steam_session.json")
@@ -254,6 +257,7 @@ async def create_trade_for_offer(
             ),
         )
         steam_offer_sent = True
+        _pending_steam_confirmations.add(int(trade_offer_id))
 
         # Step 3 — report the trade offer ID + encrypted session to CS.Money
         key_info = await client.get_security_key()
@@ -269,6 +273,7 @@ async def create_trade_for_offer(
         # Step 4 — confirm immediately (don't wait for the 15-s poller)
         logger.info("Confirming trade offer %s in Steam…", trade_offer_id)
         await steam.confirm_trade_offer(int(trade_offer_id))
+        _pending_steam_confirmations.discard(int(trade_offer_id))
         logger.info(
             "Trade offer %s confirmed. offerId=%s complete.", trade_offer_id, offer_id
         )
@@ -447,21 +452,26 @@ async def run_notification_poller(
 async def run_confirmation_poller(
     steam: SteamClient, stop_event: asyncio.Event
 ) -> None:
-    """Catch any trade confirmations that create_trade_for_offer may have missed."""
+    """
+    Confirm any trade offers that create_trade_for_offer sent but failed to confirm
+    in step 4 (e.g. due to a transient error). Only confirms trade offer IDs that
+    this tool created — never touches unrelated pending confirmations.
+    """
     logger.info("Starting confirmation poller (interval=%ds)", CONFIRMATION_INTERVAL)
     while not stop_event.is_set():
         try:
-            confs = await steam.get_confirmations()
-            if confs:
-                logger.info(
-                    "Pending confirmations: total=%d types=%s",
-                    len(confs),
-                    [c.type.name for c in confs],
-                )
-            trade_confs = [c for c in confs if c.type is ConfirmationType.TRADE]
-            if trade_confs:
-                await steam.allow_multiple_confirmations(trade_confs)
-                logger.info("Auto-confirmed %d trade confirmation(s).", len(trade_confs))
+            for trade_offer_id in list(_pending_steam_confirmations):
+                try:
+                    await steam.confirm_trade_offer(trade_offer_id)
+                    _pending_steam_confirmations.discard(trade_offer_id)
+                    logger.info(
+                        "Confirmation poller confirmed trade offer %s.", trade_offer_id
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Confirmation poller could not confirm trade offer %s: %s",
+                        trade_offer_id, exc,
+                    )
         except Exception as exc:
             logger.error("Confirmation poll error: %s", exc, exc_info=True)
 

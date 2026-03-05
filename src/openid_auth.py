@@ -149,7 +149,7 @@ def openid_login(
     logger.debug("Steam OpenID URL: %s", auth_link)
 
     csmoney_callback = _submit_openid(steam_session, auth_link)
-    logger.info("CS.Money callback URL: %s", csmoney_callback)
+    logger.debug("CS.Money callback URL obtained.")
 
     csmoney_session.get(csmoney_callback)
 
