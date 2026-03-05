@@ -38,6 +38,7 @@ import logging
 import secrets
 import time
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 import primp
 from aiosteampy import SteamClient
@@ -193,30 +194,29 @@ async def create_trade_for_offer(
         # Step 1 — notify CS.Money (response body is empty, data is in the offer dict)
         await client.initiate_trade_offer(offer_id)
 
-        # Extract partner / item data from the active-offers offer dict
-        # Log the full offer so field names are visible if extraction fails
-        partner_steam_id = str(
-            offer.get("steamId64")
-            or offer.get("partnerSteamId")
-            or offer.get("partner", {}).get("steamId64", "")
-            or offer.get("tradePartner", {}).get("steamId64", "")
-        )
-        partner_token = (
-            offer.get("token")
-            or offer.get("tradeToken")
-            or offer.get("partner", {}).get("token", "")
-            or offer.get("tradePartner", {}).get("token", "")
-        )
-        # Assets may be a top-level list or nested inside "item"
-        assets = offer.get("assets") or offer.get("items") or []
-        if not assets and offer.get("item"):
-            item = offer["item"]
-            assets = [{
-                "appid": item.get("appId", 730),
-                "contextid": str(item.get("contextId", 2)),
-                "assetid": str(item.get("assetId") or item.get("id", "")),
+        # Extract partner / item data from the active-offers offer dict.
+        # Structure: offer.buyer.steamId64, offer.buyer.token (full trade URL),
+        #            offer.sellOrders[].appId + offer.sellOrders[].asset.id
+        buyer = offer.get("buyer", {})
+        partner_steam_id = str(buyer.get("steamId64", ""))
+
+        # buyer.token is a full trade URL like:
+        # https://steamcommunity.com/tradeoffer/new/?partner=...&token=i73totMX
+        token_url = buyer.get("token", "")
+        qs = parse_qs(urlparse(token_url).query)
+        partner_token = (qs.get("token") or [""])[0]
+
+        # Build asset list from sellOrders
+        assets = []
+        for order in offer.get("sellOrders", []):
+            asset = order.get("asset", {})
+            assets.append({
+                "appid": order.get("appId", 730),
+                "contextid": "2",
+                "assetid": str(asset.get("id", "")),
                 "amount": 1,
-            }]
+            })
+
         message = offer.get("message", "")
 
         if not partner_steam_id or not partner_token or not assets:
