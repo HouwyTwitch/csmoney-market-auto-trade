@@ -18,9 +18,10 @@ class RateLimitedError(Exception):
 
 def _build_headers(extra: Optional[dict] = None) -> dict:
     headers = {
-        "accept": "application/json",
+        "accept": "*/*",
         "accept-language": "en-US,en;q=0.9",
         "content-language": "en",
+        "content-type": "application/json",
         "user-agent": config.USER_AGENT,
         "x-client-app": "CS.Money extension",
         "x-clent-version": config.EXTENSION_VERSION,
@@ -209,5 +210,6 @@ class CsMoneyClient:
 
     async def get_user_store(self) -> dict:
         url = f"{self._base}/1.0/market/user-store"
+        print(_build_headers({"x-client-app": "web"}))
         resp = await self._get(url, _build_headers({"x-client-app": "web"}))
         return resp.json()

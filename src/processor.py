@@ -530,7 +530,7 @@ async def run(stop_event: asyncio.Event) -> None:
     proxy = config.CSMONEY_PROXY or None
 
     async with primp.AsyncClient(
-        impersonate="chrome_144",
+        impersonate="chrome_148",
         impersonate_os="windows",
         proxy=proxy,
     ) as http:
