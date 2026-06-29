@@ -70,6 +70,61 @@ python main.py
 
 On first run the tool logs in to Steam and CS.Money automatically. Sessions are saved to `steam_session.json` and `csmoney_cookies.json` so subsequent starts are instant.
 
+## Run with Docker Compose
+
+The tool ships with a `Dockerfile` and `docker-compose.yml` so you can run it in a container without installing Python or any dependencies locally.
+
+### 1. Configure
+
+Same as above — create your `config.json` from the example and fill in your credentials:
+
+```bash
+cp config.example.json config.json
+```
+
+The `config.json` file is mounted into the container read-only, so editing it on the host and restarting the container is all you need to change settings.
+
+### 2. Start
+
+```bash
+docker compose up -d --build
+```
+
+This builds the image and starts the tool in the background. The first build installs all Python dependencies; subsequent starts reuse the cached image.
+
+### 3. View logs
+
+```bash
+docker compose logs -f
+```
+
+Set `"log_level": "DEBUG"` in `config.json` (then `docker compose restart`) for full diagnostic output.
+
+### 4. Stop
+
+```bash
+docker compose down
+```
+
+### Persistence
+
+The Steam and CS.Money sessions (`steam_session.json`, `csmoney_cookies.json`) are stored in a named Docker volume (`session-data`), so logins survive container restarts and rebuilds. To force a fresh login, remove the volume:
+
+```bash
+docker compose down -v
+```
+
+### Common commands
+
+| Action | Command |
+|---|---|
+| Build and start | `docker compose up -d --build` |
+| Stop | `docker compose down` |
+| Restart (e.g. after editing `config.json`) | `docker compose restart` |
+| Follow logs | `docker compose logs -f` |
+| Rebuild after a code update | `docker compose up -d --build` |
+| Reset sessions (force re-login) | `docker compose down -v` |
+
 ## Notes
 
 - **Keep `config.json` private** — it contains your Steam credentials.
