@@ -1,0 +1,17 @@
+services:
+  auto-trade:
+    build: .
+    image: csmoney-market-auto-trade
+    container_name: csmoney-auto-trade
+    restart: unless-stopped
+    # config.json holds your Steam credentials — mounted read-only.
+    # Copy config.example.json to config.json and fill it in before starting.
+    volumes:
+      - ./config.json:/app/config.json:ro
+      # Persisted Steam/CS.Money sessions survive container restarts/rebuilds.
+      - session-data:/data
+    # Surface logs immediately and keep STDOUT colored/streaming.
+    tty: true
+
+volumes:
+  session-data:

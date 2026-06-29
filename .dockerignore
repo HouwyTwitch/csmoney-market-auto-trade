@@ -1,0 +1,9 @@
+config.json
+csmoney_cookies.json
+steam_session.json
+__pycache__/
+*.pyc
+.env
+.git
+.gitignore
+README.md
